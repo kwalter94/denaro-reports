@@ -1,0 +1,6 @@
+.bsp/
+project/
+!project/build.properties
+!project/plugins.sbt
+.idea/
+target/
