@@ -57,11 +57,16 @@ object DenaroETL {
       .csv(s"$exportsPath/$currentDate-tx-types")
 
     transactions
-      .groupBy("account_name")
-      .sum("amount")
+      .groupByKey(tx => {
+        val txDate = new SimpleDateFormat("yyyy-MM-dd").parse(tx.date)
+        val month = new SimpleDateFormat("yyyy-MM-01").format(txDate)
+
+        (month, tx.account_name)
+      })
+      .agg(sum("amount").as[Double])
+      .map(row => (row._1._1, row._1._2, row._2))
       .repartition(1)
       .write
-      .option("headers", true)
       .csv(s"$exportsPath/$currentDate-tx-accounts")
 
     transactions.agg(sum("amount")).show()
@@ -108,7 +113,7 @@ object DenaroETL {
     println(s"Loading database from ${path}")
     def formatDate(date: String): String = {
       val parsedDate = new SimpleDateFormat("MM/dd/yyyy").parse(date)
-      return new SimpleDateFormat("yyyy/MM/dd").format(parsedDate)
+      return new SimpleDateFormat("yyyy-MM-dd").format(parsedDate)
     }
 
     return session.read
