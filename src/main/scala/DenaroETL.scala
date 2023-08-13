@@ -23,8 +23,7 @@ object DenaroETL {
 
     import session.implicits._
 
-    val exchangeRates = session
-      .read
+    val exchangeRates = session.read
       .option("multiline", true)
       .option("headers", true)
       .json(s"$homePath/exchange_rates.json")
@@ -35,11 +34,15 @@ object DenaroETL {
       .reduce((txDatasetA, txDatasetB) => txDatasetA.union(txDatasetB))
 
     transactions = transactions
-      .join(exchangeRates, exchangeRates("currency") === transactions("currency_code"))
+      .join(
+        exchangeRates,
+        exchangeRates("currency") === transactions("currency_code")
+      )
       .withColumn("amount", column("amount") * column("value"))
       .as[Transaction]
 
-    val currentDate = new SimpleDateFormat("yyyy-MM-dd_hh-mm-ss").format(new Date)
+    val currentDate =
+      new SimpleDateFormat("yyyy-MM-dd_hh-mm-ss").format(new Date)
     val exportsPath = s"$denaroHomePath/exports"
 
     transactions
@@ -48,23 +51,28 @@ object DenaroETL {
       .option("headers", true)
       .csv(s"$exportsPath/$currentDate-tx-raw")
 
+    val groupMonthlyTransactionsBy = (selector: (Transaction) => String) => {
+      (tx: Transaction) => {
+        val txDate = new SimpleDateFormat("yyyy-MM-dd").parse(tx.date)
+        val month = new SimpleDateFormat("yyyy-MM-01").format(txDate)
+
+        MonthlyTransactionsGrouping(month, selector(tx))
+      }
+    }
+
     transactions
-      .groupBy("group")
-      .sum("amount")
+      .groupByKey(groupMonthlyTransactionsBy(tx => tx.group))
+      .agg(sum("amount").as[Double])
+      .map(row => (row._1.month, row._1.name, row._2))
       .repartition(1)
       .write
       .option("headers", true)
       .csv(s"$exportsPath/$currentDate-tx-types")
 
     transactions
-      .groupByKey(tx => {
-        val txDate = new SimpleDateFormat("yyyy-MM-dd").parse(tx.date)
-        val month = new SimpleDateFormat("yyyy-MM-01").format(txDate)
-
-        (month, tx.account_name)
-      })
+      .groupByKey(groupMonthlyTransactionsBy(tx => tx.account_name))
       .agg(sum("amount").as[Double])
-      .map(row => (row._1._1, row._1._2, row._2))
+      .map(row => (row._1.month, row._1.name, row._2))
       .repartition(1)
       .write
       .csv(s"$exportsPath/$currentDate-tx-accounts")
@@ -150,6 +158,11 @@ object DenaroETL {
   case class ExchangeRate(
       currency: String,
       value: Double
+  )
+
+  case class MonthlyTransactionsGrouping(
+      month: String,
+      name: String
   )
 
   object SqliteDialect extends JdbcDialect {
