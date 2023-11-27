@@ -5,7 +5,7 @@ import java.sql.Types
 
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.functions.{column, sum, typedLit}
+import org.apache.spark.sql.functions.{column, lit, sum, typedLit, max}
 import org.apache.spark.sql.jdbc.{JdbcDialect, JdbcDialects, JdbcType}
 import org.apache.spark.sql.types._
 
@@ -29,38 +29,42 @@ object DenaroETL {
       .json(s"$homePath/exchange_rates.json")
       .as[ExchangeRate]
 
+    val defaultRate = exchangeRates.where(column("value") === 1.0).first()
+
     var transactions = getDatabaseFiles()
       .map(db => loadTransactions(session, db))
       .reduce((txDatasetA, txDatasetB) => txDatasetA.union(txDatasetB))
 
-    transactions = transactions
-      .join(
-        exchangeRates,
-        exchangeRates("currency") === transactions("currency_code")
-      )
-      .withColumn("amount", column("amount") * column("value"))
-      .as[Transaction]
+    var localisedTransactions = transactions
+      .join(exchangeRates)
+      .where(exchangeRates("currency") === transactions("currencyCode"))
+      .withColumnRenamed("amount", "originalAmount")
+      .withColumnRenamed("currencyCode", "originalCurrency")
+      .withColumn("amount", column("originalAmount") * column("value"))
+      .withColumn("currency", lit(defaultRate.currency))
+      .as[LocalisedTransaction]
 
     val currentDate =
       new SimpleDateFormat("yyyy-MM-dd_hh-mm-ss").format(new Date)
     val exportsPath = s"$denaroHomePath/exports"
 
-    transactions
+    localisedTransactions
       .repartition(1)
       .write
       .option("headers", true)
       .csv(s"$exportsPath/$currentDate-tx-raw")
 
-    val groupMonthlyTransactionsBy = (selector: (Transaction) => String) => {
-      (tx: Transaction) => {
-        val txDate = new SimpleDateFormat("yyyy-MM-dd").parse(tx.date)
-        val month = new SimpleDateFormat("yyyy-MM-01").format(txDate)
+    val groupMonthlyTransactionsBy =
+      (selector: (LocalisedTransaction) => String) => {
+        (tx: LocalisedTransaction) => {
+          val txDate = new SimpleDateFormat("yyyy-MM-dd").parse(tx.date)
+          val month = new SimpleDateFormat("yyyy-MM-01").format(txDate)
 
-        MonthlyTransactionsGrouping(month, selector(tx))
+          MonthlyTransactionsGrouping(month, selector(tx))
+        }
       }
-    }
 
-    transactions
+    localisedTransactions
       .groupByKey(groupMonthlyTransactionsBy(tx => tx.group))
       .agg(sum("amount").as[Double])
       .map(row => (row._1.month, row._1.name, row._2))
@@ -69,15 +73,20 @@ object DenaroETL {
       .option("headers", true)
       .csv(s"$exportsPath/$currentDate-tx-types")
 
-    transactions
-      .groupByKey(groupMonthlyTransactionsBy(tx => tx.account_name))
-      .agg(sum("amount").as[Double])
-      .map(row => (row._1.month, row._1.name, row._2))
+    localisedTransactions
+      .groupByKey(groupMonthlyTransactionsBy(tx => tx.accountName))
+      .agg(
+        sum("amount").as[Double],
+        max("currency").as[String],
+        sum("originalAmount").as[Double],
+        max("originalCurrency").as[String]
+      )
+      .map(row => (row._1.month, row._1.name, row._2, row._3, row._4, row._5))
       .repartition(1)
       .write
       .csv(s"$exportsPath/$currentDate-tx-accounts")
 
-    transactions.agg(sum("amount")).show()
+    localisedTransactions.agg(sum("amount")).show()
 
     System.exit(0)
   }
@@ -137,9 +146,9 @@ object DenaroETL {
           amount = row.getAs[String]("amount").toDouble,
           transactionType = row.getAs[String]("type"),
           group = row.getAs[String]("group"),
-          account_name = row.getAs[String]("account_name"),
-          currency_code = row.getAs[String]("currency_code"),
-          source_file = path
+          accountName = row.getAs[String]("account_name"),
+          currencyCode = row.getAs[String]("currency_code"),
+          sourceFile = path
         )
       )
   }
@@ -150,9 +159,22 @@ object DenaroETL {
       transactionType: String,
       amount: Double,
       group: String,
-      account_name: String,
-      currency_code: String,
-      source_file: String
+      accountName: String,
+      currencyCode: String,
+      sourceFile: String
+  )
+
+  case class LocalisedTransaction(
+      id: String,
+      date: String,
+      transactionType: String,
+      originalAmount: Double,
+      originalCurrency: String,
+      amount: Double,
+      currency: String,
+      group: String,
+      accountName: String,
+      sourceFile: String
   )
 
   case class ExchangeRate(
