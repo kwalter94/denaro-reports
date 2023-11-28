@@ -1,21 +1,17 @@
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
-import java.sql.Types
 
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.{column, lit, sum, typedLit, max}
-import org.apache.spark.sql.jdbc.{JdbcDialect, JdbcDialects, JdbcType}
-import org.apache.spark.sql.types._
 
 object DenaroETL {
   val homePath = System.getenv("HOME")
   val denaroHomePath = s"$homePath/Denaro"
+  val denaroExportsPath = s"$denaroHomePath/exports"
 
   def main(args: Array[String]): Unit = {
-    JdbcDialects.registerDialect(SqliteDialect)
-
     val session = SparkSession.builder
       .appName("DenaroETL")
       .config("spark.master", "local")
@@ -31,7 +27,7 @@ object DenaroETL {
 
     val defaultRate = exchangeRates.where(column("value") === 1.0).first()
 
-    var transactions = getDatabaseFiles()
+    val transactions = databaseFiles
       .map(db => loadTransactions(session, db))
       .reduce((txDatasetA, txDatasetB) => txDatasetA.union(txDatasetB))
 
@@ -44,58 +40,21 @@ object DenaroETL {
       .withColumn("currency", lit(defaultRate.currency))
       .as[LocalisedTransaction]
 
-    val currentDate =
-      new SimpleDateFormat("yyyy-MM-dd_hh-mm-ss").format(new Date)
-    val exportsPath = s"$denaroHomePath/exports"
-
-    localisedTransactions
-      .repartition(1)
-      .write
-      .option("headers", true)
-      .csv(s"$exportsPath/$currentDate-tx-raw")
-
-    val groupMonthlyTransactionsBy =
-      (selector: (LocalisedTransaction) => String) => {
-        (tx: LocalisedTransaction) => {
-          val txDate = new SimpleDateFormat("yyyy-MM-dd").parse(tx.date)
-          val month = new SimpleDateFormat("yyyy-MM-01").format(txDate)
-
-          MonthlyTransactionsGrouping(month, selector(tx))
-        }
-      }
-
-    localisedTransactions
-      .groupByKey(groupMonthlyTransactionsBy(tx => tx.group))
-      .agg(sum("amount").as[Double])
-      .map(row => (row._1.month, row._1.name, row._2))
-      .repartition(1)
-      .write
-      .option("headers", true)
-      .csv(s"$exportsPath/$currentDate-tx-types")
-
-    localisedTransactions
-      .groupByKey(groupMonthlyTransactionsBy(tx => tx.accountName))
-      .agg(
-        sum("amount").as[Double],
-        max("currency").as[String],
-        sum("originalAmount").as[Double],
-        max("originalCurrency").as[String]
-      )
-      .map(row => (row._1.month, row._1.name, row._2, row._3, row._4, row._5))
-      .repartition(1)
-      .write
-      .csv(s"$exportsPath/$currentDate-tx-accounts")
-
-    localisedTransactions.agg(sum("amount")).show()
+    processTransactionTypeAggregates(session, localisedTransactions)
+    processAccountAggregates(session, localisedTransactions)
+    processRawTransactions(session, localisedTransactions)
 
     System.exit(0)
   }
 
-  def getDatabaseFiles(): Iterable[String] =
-    new File(s"""${System.getenv("HOME")}/Denaro""")
+  def databaseFiles =
+    new File(denaroHomePath)
       .listFiles()
       .filter(f => f.getName().endsWith(".nmoney"))
       .map(f => f.getPath())
+
+  def currentDate =
+    new SimpleDateFormat("yyyy-MM-dd_hh-mm-ss").format(new Date)
 
   def loadTransactions(
       session: SparkSession,
@@ -126,6 +85,7 @@ object DenaroETL {
         ON 1 = 1
     """
     import session.implicits._
+    SqliteDialect.autoRegisterDialect
 
     println(s"Loading database from ${path}")
     def formatDate(date: String): String = {
@@ -152,6 +112,65 @@ object DenaroETL {
         )
       )
   }
+
+  def processRawTransactions(
+      _session: SparkSession,
+      transactions: Dataset[LocalisedTransaction]
+  ): Unit = {
+    transactions
+      .repartition(1)
+      .write
+      .option("headers", true)
+      .csv(s"$denaroExportsPath/$currentDate-tx-raw")
+
+    transactions.agg(sum("amount")).show()
+  }
+
+  def processTransactionTypeAggregates(
+      session: SparkSession,
+      transactions: Dataset[LocalisedTransaction]
+  ): Unit = {
+    import session.implicits._
+
+    transactions
+      .groupByKey(groupMonthlyTransactionsBy(tx => tx.group))
+      .agg(sum("amount").as[Double])
+      .map(row => (row._1.month, row._1.name, row._2))
+      .repartition(1)
+      .write
+      .option("headers", true)
+      .csv(s"$denaroExportsPath/$currentDate-tx-types")
+  }
+
+  def processAccountAggregates(
+      session: SparkSession,
+      transactions: Dataset[LocalisedTransaction]
+  ): Unit = {
+    import session.implicits._
+
+    transactions
+      .groupByKey(groupMonthlyTransactionsBy(tx => tx.accountName))
+      .agg(
+        sum("amount").as[Double],
+        max("currency").as[String],
+        sum("originalAmount").as[Double],
+        max("originalCurrency").as[String]
+      )
+      .map(row => (row._1.month, row._1.name, row._2, row._3, row._4, row._5))
+      .repartition(1)
+      .write
+      .csv(s"$denaroExportsPath/$currentDate-tx-accounts")
+  }
+
+  def groupMonthlyTransactionsBy(
+      bucketingStrategy: LocalisedTransaction => String
+  ): LocalisedTransaction => MonthlyTransactionsGrouping =
+    (tx: LocalisedTransaction) => {
+      val txDate = new SimpleDateFormat("yyyy-MM-dd").parse(tx.date)
+      val month = new SimpleDateFormat("yyyy-MM-01").format(txDate)
+
+      MonthlyTransactionsGrouping(month, bucketingStrategy(tx))
+    }
 
   case class Transaction(
       id: String,
@@ -186,26 +205,4 @@ object DenaroETL {
       month: String,
       name: String
   )
-
-  object SqliteDialect extends JdbcDialect {
-    override def canHandle(url: String): Boolean = url.startsWith("jdbc:sqlite")
-
-    override def getCatalystType(
-        sqlType: Int,
-        typeName: String,
-        size: Int,
-        md: MetadataBuilder
-    ): Option[DataType] =
-      sqlType match {
-        case Types.DOUBLE => Some(DoubleType)
-        case _            => Some(StringType)
-      }
-
-    override def getJDBCType(dt: DataType): Option[JdbcType] =
-      dt match {
-        case DoubleType => Some(JdbcType("DOUBLE", Types.DOUBLE))
-        case StringType => Some(JdbcType("VARCHAR", Types.VARCHAR))
-        case _          => None
-      }
-  }
 }
